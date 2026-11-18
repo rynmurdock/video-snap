@@ -10,3 +10,4 @@ bitsandbytes
 gguf
 opencv-python
 huggingface_hub
+kernels

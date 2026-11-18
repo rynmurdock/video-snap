@@ -7,7 +7,9 @@ import sys
 
 import numpy as np
 
+import run.make_masklets  # noqa: F401 (import check)
 import run.process_one_video  # noqa: F401 (import check)
+from lib.masklets import compose_masklets, get_masklet_model, make_masklets
 from lib.video_inpainting import _composite, _prepare, get_video_model, inpaint_video
 
 
@@ -29,6 +31,22 @@ def test_shapes():
     assert (out[masks > 0] == 0).all() and (out[masks == 0] == video[masks == 0]).all()
 
 
+def test_compose():
+    a, b = np.zeros((2, 4, 4), np.uint8), np.zeros((2, 4, 4), np.uint8)
+    a[:, :2], b[:, :, :2] = 255, 255
+    assert (compose_masklets([a, b], "union") > 0).sum() == 2 * 12
+    assert (compose_masklets([a, b], "intersect") > 0).sum() == 2 * 4
+    assert (compose_masklets([a, b], "subtract") > 0).sum() == 2 * 4
+    assert compose_masklets([a], "subtract").dtype == np.uint8
+
+
+def test_full_masklets():
+    video, _ = synthetic_clip()
+    masklets = make_masklets(video, ["dog", "car"], get_masklet_model())
+    assert set(masklets) == {"dog", "car"}
+    assert all(m.shape == video.shape[:3] and m.dtype == np.uint8 for m in masklets.values())
+
+
 def test_full_model():
     video, masks = synthetic_clip()
     out = inpaint_video(video, masks, get_video_model(), long_side=256)
@@ -39,6 +57,8 @@ def test_full_model():
 
 if __name__ == "__main__":
     test_shapes()
+    test_compose()
     if "--full" in sys.argv:
+        test_full_masklets()
         test_full_model()
     print("smoke ok")
