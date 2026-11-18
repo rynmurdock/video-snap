@@ -48,7 +48,7 @@ def make_masklets(video, prompts, model):
         masks, object_ids = frame["masks"], frame["object_ids"].tolist()
         for prompt, prompt_ids in frame["prompt_to_obj_ids"].items():
             rows = [object_ids.index(obj_id) for obj_id in prompt_ids]
-            masklets[prompt][outputs.frame_idx] = masks[rows].any(dim=0).cpu().numpy() * 255
+            masklets[prompt][outputs.frame_idx] = np.where(masks[rows].any(dim=0).cpu().numpy(), 255, 0)
     return masklets
 
 

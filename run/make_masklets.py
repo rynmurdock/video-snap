@@ -1,7 +1,7 @@
 """Make a masklet video from text prompts, optionally composed with existing mask videos.
 
-python -m run.make_masklets --video in.mp4 --prompt "dog" --out dog.mp4
-python -m run.make_masklets --video in.mp4 --prompt "person" --masks face.mp4 --compose subtract --out body.mp4
+python -m run.make_masklets --video in.mp4 --masklet-prompt "dog" --out dog.mp4
+python -m run.make_masklets --video in.mp4 --masks person.mp4 --masklet-prompt "face" --compose subtract --out body.mp4
 """
 import argparse
 
@@ -9,9 +9,9 @@ from lib.masklets import COMPOSE_OPS, compose_masklets, free_model, get_masklet_
 from lib.video_io import read_masks, read_video, write_video
 
 
-def add_masklet_args(parser, prompt_flag="--prompt"):
-    parser.add_argument("--masks", nargs="*", default=[], help="mask videos; white = masked")
-    parser.add_argument(prompt_flag, dest="masklet_prompts", action="append", default=[],
+def add_masklet_args(parser):
+    parser.add_argument("--masks", nargs="+", action="extend", default=[], help="mask videos; white = masked")
+    parser.add_argument("--masklet-prompt", dest="masklet_prompts", action="append", default=[],
                         help="SAM3 text prompt for a region to mask, e.g. 'dog'; repeat for several")
     parser.add_argument("--compose", choices=COMPOSE_OPS, default="union",
                         help="how to combine masklets; subtract = first minus the rest (--masks come first)")
@@ -20,6 +20,10 @@ def add_masklet_args(parser, prompt_flag="--prompt"):
 def collect_masks(video, mask_paths, prompts, op, max_frames=None):
     """Read mask videos, make prompt masklets, and compose all of them (mask files first)."""
     masklets = [read_masks(path, max_frames) for path in mask_paths]
+    for path, masklet in zip(mask_paths, masklets):
+        if masklet.shape != video.shape[:3]:
+            raise ValueError(f"{path} is (T, H, W) = {masklet.shape}, video is {video.shape[:3]}")
+    prompts = list(dict.fromkeys(prompts))
     if prompts:
         model = get_masklet_model()
         by_prompt = make_masklets(video, prompts, model)
@@ -36,7 +40,7 @@ def parse_args():
     add_masklet_args(parser)
     args = parser.parse_args()
     if not args.masks and not args.masklet_prompts:
-        parser.error("give at least one --prompt or --masks")
+        parser.error("give at least one --masklet-prompt or --masks")
     return args
 
 

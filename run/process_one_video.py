@@ -13,7 +13,7 @@ from run.make_masklets import add_masklet_args, collect_masks
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--video", required=True)
-    add_masklet_args(parser, prompt_flag="--masklet-prompt")
+    add_masklet_args(parser)
     parser.add_argument("--save-masks", default=None, help="also write the composed mask video here")
     parser.add_argument("--out", required=True)
     parser.add_argument("--prompt", default=None, help="describe only the masked region")
@@ -33,6 +33,8 @@ def main():
     masks = collect_masks(video, args.masks, args.masklet_prompts, args.compose, args.max_frames)
     if args.save_masks:
         write_video(args.save_masks, masks[..., None].repeat(3, axis=-1), fps)
+    if not masks.any():
+        raise SystemExit("masks are empty; nothing to inpaint")
     model = get_video_model()
     inpainted = inpaint_video(
         video, masks, model, prompt=args.prompt, seed=args.seed, long_side=args.long_side, fps=fps
