@@ -11,7 +11,7 @@ import numpy as np
 
 import run.process_one_video  # noqa: F401 (import check)
 from lib.masklets import compose_masklets, free_model, get_masklet_model, make_masklets
-from lib.video_inpainting import _composite, _prepare, get_video_model, inpaint_video
+from lib.video_inpainting import _composite, _prepare, _stage_1_long_side, get_video_model, inpaint_video
 from lib.video_io import write_video
 from run.make_masklets import collect_masks
 
@@ -28,6 +28,7 @@ def test_shapes():
     video, masks = synthetic_clip()
     frames, gen_masks = _prepare(video, masks, long_side=256)
     assert frames.shape == (17, 128, 256, 3) and gen_masks.shape == (17, 128, 256)
+    assert [_stage_1_long_side(s, 768) for s in ((180, 320), (720, 1280), (2160, 3840))] == [256, 640, 768]
     generated = np.zeros((len(video), 256, 512, 3), dtype=np.uint8)
     out = _composite(video, masks, generated, feather_px=0)
     assert out.shape == video.shape and out.dtype == np.uint8

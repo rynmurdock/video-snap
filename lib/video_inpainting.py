@@ -27,6 +27,7 @@ LORA_FILE = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
 DTYPE = torch.bfloat16
 FRAME_STEP = 8  # the VAE compresses time 8x, so frame counts must be 8k + 1
 SIZE_STEP = 32
+MIN_STAGE_1_LONG_SIDE = 256  # below this LTX output degrades; tiny clips render above source size
 GREEN_RGB = (102, 255, 0)  # the IC-LoRA was trained with masked pixels painted this key colour
 STAGE_2_SIGMAS = [0.725, 0.421875]  # the official workflow's refine schedule
 
@@ -71,15 +72,21 @@ def inpaint_video(video, masks, model, prompt=None, seed=0, long_side=768, fps=2
     """Regenerate the masked region; returns a video shaped like the input.
 
     `prompt` should describe only the masked region (None works for removal).
-    `long_side` is the stage-1 generation size; stage 2 refines at twice that.
+    `long_side` caps the stage-1 generation size; stage 2 refines at twice that.
     `dilate_px` grows the mask at stage-1 size so the fill covers the object's edges.
     """
     check_video(video)
     if masks.shape != video.shape[:3]:
         raise ValueError(f"masks must be (T, H, W) = {video.shape[:3]}, got {masks.shape}")
+    long_side = _stage_1_long_side(video.shape[1:3], long_side)
     frames, gen_masks = _prepare(video, masks, long_side, dilate_px)
     generated = _generate(frames, gen_masks, model, prompt or "", seed, fps)
     return _composite(video, _resize_masks(gen_masks[: len(video)], video.shape[1:3]), generated, feather_px)
+
+
+def _stage_1_long_side(size, long_side):
+    """Half the source's long side, so stage 2 lands near source resolution; floored for quality."""
+    return max(min(long_side, max(size) // 2), MIN_STAGE_1_LONG_SIDE)
 
 
 def _generation_size(height, width, long_side):
