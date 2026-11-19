@@ -24,7 +24,7 @@ python -m run.make_masklets --video in.mp4 --masklet-prompt "dog" --out dog.mp4
 - Repeat `--masklet-prompt` & pass several `--masks` to compose them.
 - `--compose union|intersect|subtract`; subtract = first minus the rest, with `--masks` ordered before prompts:
 
-python -m run.process_one_video --video in.mp4 --masks person.mp4 --masklet-prompt "face" --compose subtract --save-masks body.mp4 --out out.mp4
+python -m run.process_one_video --video /home/ryn_mote/Misc/INTERMARCHE_TEST.mp4 --masklet-prompt "person" --save-masks body.mp4 --out out.mp4
 
 # Smoke test
 
