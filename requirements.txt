@@ -1,7 +1,7 @@
 torch
 torchvision
-diffusers @ git+https://github.com/huggingface/diffusers
-transformers
+diffusers @ git+https://github.com/huggingface/diffusers@8edb6d8c9466313ff39d7d441474700ac2a442b1
+transformers>=5.23
 accelerate
 peft
 safetensors
@@ -9,5 +9,7 @@ sentencepiece
 bitsandbytes
 gguf
 opencv-python
+numpy
+pillow
 huggingface_hub
 kernels
