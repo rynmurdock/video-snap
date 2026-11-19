@@ -39,10 +39,10 @@ def make_masklets(video, prompts, model):
     check_video(video)
     processor, sam = model["processor"], model["model"]
     _check_prompts(prompts, processor.tokenizer)
-    # Frames stay on the CPU: only the tracker state lives on the GPU.
+    # Frames & per-frame tracker outputs stay on the CPU, so GPU memory doesn't grow with length.
     session = processor.init_video_session(
-        video=np.ascontiguousarray(video[..., ::-1]), inference_device="cuda",
-        processing_device="cpu", video_storage_device="cpu", dtype=DTYPE,
+        video=np.ascontiguousarray(video[..., ::-1]), inference_device="cuda", processing_device="cpu",
+        video_storage_device="cpu", inference_state_device="cpu", dtype=DTYPE,
     )
     processor.add_text_prompt(session, list(prompts))
 

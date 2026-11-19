@@ -2,6 +2,7 @@
 
 Videos are cv2 arrays: (T, H, W, 3) uint8 BGR. Masks are (T, H, W), nonzero = inpaint.
 Follows Lightricks' official two-stage inpaint workflow (green-keyed reference, pixel 2x refine).
+Long videos run in overlapping windows; each window is pinned to the previous one's overlap frames.
 """
 import cv2
 import numpy as np
@@ -9,6 +10,7 @@ import torch
 from diffusers import GGUFQuantizationConfig, LTX2InContextPipeline, LTX2VideoTransformer3DModel
 from diffusers.loaders.single_file_model import SINGLE_FILE_LOADABLE_CLASSES
 from diffusers.loaders.single_file_utils import convert_ltx2_transformer_to_diffusers
+from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
 from diffusers.pipelines.ltx2.pipeline_ltx2_ic_lora import LTX2ReferenceCondition, retrieve_latents
 from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
 from huggingface_hub import hf_hub_download
@@ -30,6 +32,10 @@ SIZE_STEP = 32
 MIN_STAGE_1_LONG_SIDE = 256  # below this LTX output degrades; tiny clips render above source size
 GREEN_RGB = (102, 255, 0)  # the IC-LoRA was trained with masked pixels painted this key colour
 STAGE_2_SIGMAS = [0.725, 0.421875]  # the official workflow's refine schedule
+# Stage-2 latent tokens per window: 97 frames (13 latent) of 1080p (28x48 tokens) is the measured-safe 4090 point.
+STAGE_2_TOKEN_BUDGET = 13 * 28 * 48
+MAX_WINDOW_FRAMES = 121  # measured to fit at 1080p (21.3G); also caps small sources near LTX's usual lengths
+OVERLAP_FRAMES = 25  # 4 latent frames, ~1 s of shared context between windows
 
 
 def get_video_model(model_path="Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting"):
@@ -68,20 +74,65 @@ def _load_transformer():
     )
 
 
-def inpaint_video(video, masks, model, prompt=None, seed=0, long_side=768, fps=24, dilate_px=15, feather_px=6):
+def inpaint_video(
+        video, masks, model, prompt=None, seed=0, long_side=768, fps=24, dilate_px=15, feather_px=6,
+        window=None, overlap=OVERLAP_FRAMES,
+        ):
     """Regenerate the masked region; returns a video shaped like the input.
 
     `prompt` should describe only the masked region (None works for removal).
     `long_side` caps the stage-1 generation size; stage 2 refines at twice that.
     `dilate_px` grows the mask at stage-1 size so the fill covers the object's edges.
+    `window`/`overlap` (8k + 1 frames) split long videos; window None fits the 4090 at this size.
     """
     check_video(video)
     if masks.shape != video.shape[:3]:
         raise ValueError(f"masks must be (T, H, W) = {video.shape[:3]}, got {masks.shape}")
     long_side = _stage_1_long_side(video.shape[1:3], long_side)
-    frames, gen_masks = _prepare(video, masks, long_side, dilate_px)
-    generated = _generate(frames, gen_masks, model, prompt or "", seed, fps)
-    return _composite(video, _resize_masks(gen_masks[: len(video)], video.shape[1:3]), generated, feather_px)
+    window = window or _window_frames(*_generation_size(*video.shape[1:3], long_side), overlap)
+    spans = _windows(len(video), window, overlap)
+    encoded_prompt = _encode_prompt(model["pipe"], prompt or "")
+    out = np.empty_like(video)
+    context = None
+    for i, (start, stop) in enumerate(spans):
+        frames, gen_masks = _prepare(video[start:stop], masks[start:stop], long_side, dilate_px)
+        stage_1, stage_2 = _generate(frames, gen_masks, model, encoded_prompt, seed + i, fps, context)
+        real = stop - start  # drop the 8k + 1 padding frames
+        stage_1, stage_2 = stage_1[:real], stage_2[:real]
+        if context is not None:
+            # Crossfade from the previous window's frames to this one's across the overlap.
+            weight = (np.arange(1, overlap + 1, dtype=np.float32) / (overlap + 1))[:, None, None, None]
+            stage_2[:overlap] = (context[1] * (1 - weight) + stage_2[:overlap] * weight).round().astype(np.uint8)
+        # Overlap frames are finalized only once the next window has blended into them.
+        done = real if i == len(spans) - 1 else real - overlap
+        span = slice(start, start + done)
+        final_masks = _resize_masks(gen_masks[:done], video.shape[1:3])
+        out[span] = _composite(video[span], final_masks, stage_2[:done, ..., ::-1], feather_px)
+        context = (stage_1[real - overlap:].copy(), stage_2[real - overlap:].copy())
+        torch.cuda.empty_cache()
+    return out
+
+
+def _window_frames(height, width, overlap=OVERLAP_FRAMES):
+    """Longest 8k + 1 window whose stage-2 tokens (at twice this stage-1 size) fit the VRAM budget."""
+    tokens_per_latent_frame = (height * 2 // SIZE_STEP) * (width * 2 // SIZE_STEP)
+    for frames in range(MAX_WINDOW_FRAMES, overlap + FRAME_STEP - 1, -FRAME_STEP):
+        if tokens_per_latent_frame * ((frames - 1) // FRAME_STEP + 1) <= STAGE_2_TOKEN_BUDGET:
+            return frames
+    return overlap + FRAME_STEP  # over budget even at the minimum; may OOM, as unwindowed runs did
+
+
+def _windows(num_frames, window, overlap):
+    """(start, stop) spans covering every frame, consecutive spans sharing exactly `overlap` frames."""
+    if window % FRAME_STEP != 1 or overlap % FRAME_STEP != 1:
+        raise ValueError(f"window ({window}) and overlap ({overlap}) must be 8k + 1 frames")
+    if window < overlap + FRAME_STEP:
+        raise ValueError(f"window ({window}) must be at least overlap + {FRAME_STEP} ({overlap + FRAME_STEP})")
+    spans = [(0, min(window, num_frames))]
+    while spans[-1][1] < num_frames:
+        start = spans[-1][1] - overlap
+        spans.append((start, min(start + window, num_frames)))
+    return spans
 
 
 def _stage_1_long_side(size, long_side):
@@ -129,12 +180,27 @@ def _resize_masks(masks, size):
 
 
 @torch.inference_mode()
-def _generate(frames, gen_masks, model, prompt, seed, fps):
-    """Two-stage LTX inpaint; returns (T, 2H, 2W, 3) uint8 BGR at twice the generation size."""
+def _encode_prompt(pipe, prompt):
+    prompt_embeds, prompt_mask, _, _ = pipe.encode_prompt(prompt, do_classifier_free_guidance=False, device="cuda")
+    return prompt_embeds, prompt_mask
+
+
+@torch.inference_mode()
+def _generate(frames, gen_masks, model, encoded_prompt, seed, fps, context=None):
+    """Two-stage LTX inpaint; returns RGB (stage-1 composite (T, H, W, 3), stage 2 (T, 2H, 2W, 3)).
+
+    `context` = (stage-1, stage-2) frames from the previous window; they are pinned as this window's start.
+    """
     pipe = model["pipe"]
     num_frames, height, width = gen_masks.shape
     generator = torch.Generator("cuda").manual_seed(seed)
-    prompt_embeds, prompt_mask, _, _ = pipe.encode_prompt(prompt, do_classifier_free_guidance=False, device="cuda")
+    prompt_embeds, prompt_mask = encoded_prompt
+    pins = [None, None]
+    if context is not None:
+        # The overlap shows the previous result un-greened, and conditioning keeps its latents clean.
+        frames, gen_masks = frames.copy(), gen_masks.copy()
+        frames[: len(context[0])], gen_masks[: len(context[0])] = context[0], False
+        pins = [[LTX2VideoCondition(frames=f, index=0, strength=1.0)] for f in context]
     # Every guidance knob off: the distilled model is meant to run unguided.
     shared = dict(
         prompt_embeds=prompt_embeds, prompt_attention_mask=prompt_mask, num_frames=num_frames, frame_rate=fps,
@@ -149,7 +215,7 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
     pipe.enable_lora()
     video_latent, audio_latent = pipe(
         reference_conditions=[LTX2ReferenceCondition(frames=[Image.fromarray(f) for f in reference])],
-        reference_downscale_factor=1, width=width, height=height,
+        conditions=pins[0], reference_downscale_factor=1, width=width, height=height,
         sigmas=DISTILLED_SIGMA_VALUES, num_inference_steps=len(DISTILLED_SIGMA_VALUES), **shared,
     )
 
@@ -159,12 +225,13 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
     pipe.disable_lora()
     try:
         refined, _ = pipe(
-            latents=_encode(pipe, upscaled), audio_latents=audio_latent, width=width * 2, height=height * 2,
+            latents=_encode(pipe, upscaled), audio_latents=audio_latent, conditions=pins[1],
+            width=width * 2, height=height * 2,
             sigmas=STAGE_2_SIGMAS, num_inference_steps=len(STAGE_2_SIGMAS), **shared,
         )
     finally:
         pipe.enable_lora()
-    return np.ascontiguousarray(_decode(pipe, refined)[..., ::-1])
+    return stage_1, _decode(pipe, refined)
 
 
 def _decode(pipe, latents):

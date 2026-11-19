@@ -15,6 +15,8 @@ python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out out.mp4
 - `--prompt` is optional & should describe only the masked region.
 - First run downloads ~37 GB of weights to the Hugging Face cache; accept the gated
   [IC-LoRA license](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting) first.
+- Whole videos by default (`--max-frames N` to trim); long ones run in overlapping windows sized to fit a 4090.
+- Everything sits in RAM, roughly 20 MB per 1080p frame (video, output, masks, SAM3 copies): trim or downscale very long videos.
 - Output is silent mp4v at the source fps; for variable-frame-rate input, convert first: `ffmpeg -i in.mp4 -vf fps=24 cfr.mp4`.
 
 # Masklets from text prompts (SAM3)
