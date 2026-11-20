@@ -9,13 +9,10 @@ import contextlib
 import cv2
 import numpy as np
 import torch
-from diffusers import (
-    FlowMatchEulerDiscreteScheduler, GGUFQuantizationConfig, LTX2InContextPipeline, LTX2VideoTransformer3DModel
-)
-from diffusers.loaders.single_file_model import SINGLE_FILE_LOADABLE_CLASSES
-from diffusers.loaders.single_file_utils import convert_ltx2_transformer_to_diffusers
+from diffusers import FlowMatchEulerDiscreteScheduler, LTX2InContextPipeline
 from diffusers.models.latent_upscaler.latent_upscaler_ltx2 import LTX2LatentUpsamplerModel
-from diffusers.pipelines.ltx2.pipeline_ltx2_ic_lora import LTX2ReferenceCondition, retrieve_latents
+from diffusers.pipelines.ltx2 import LTX2LatentUpsamplePipeline
+from diffusers.pipelines.ltx2.pipeline_ltx2_ic_lora import LTX2ReferenceCondition
 from diffusers.pipelines.ltx2.utils import (
     DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
 )
@@ -23,17 +20,11 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import load_file
-from transformers import Gemma3ForConditionalGeneration
 
 from lib.video_io import check_video
 
-# Quantized weights: the full-precision model (95 GB, 38 GB transformer) does not fit a 4090.
 BASE_REPO = "diffusers/LTX-2.3-Diffusers"
 DISTILLED_BASE_REPO = "diffusers/LTX-2.3-Distilled-Diffusers"
-TRANSFORMER_REPO = "QuantStack/LTX-2.3-GGUF"
-TRANSFORMER_FILE = "LTX-2.3-dev/LTX-2.3-dev-Q4_K_M.gguf"  # no 1.1 dev release exists; distilled is 1.1
-DISTILLED_TRANSFORMER_FILE = "LTX-2.3-distilled-1.1/LTX-2.3-22B-distilled-1.1-Q4_K_M.gguf"
-TEXT_ENCODER_REPO = "unsloth/gemma-3-12b-it-qat-bnb-4bit"
 LORA_FILE = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
 LTX_REPO = "Lightricks/LTX-2.3"
 DISTILLED_LORA_FILE = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"  # stage-2 refiner on top of dev
@@ -59,24 +50,20 @@ NO_GUIDANCE = dict(
 
 def get_video_model(model_path="Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", distilled=False):
     """Load the inpainting models; `model_path` is the IC-LoRA repo, `distilled` picks the fast base model."""
-    base_repo = DISTILLED_BASE_REPO if distilled else BASE_REPO
-    transformer = _load_transformer(DISTILLED_TRANSFORMER_FILE if distilled else TRANSFORMER_FILE, base_repo)
-    text_encoder = Gemma3ForConditionalGeneration.from_pretrained(TEXT_ENCODER_REPO, dtype=DTYPE)
-    pipe = LTX2InContextPipeline.from_pretrained(
-        base_repo, transformer=transformer, text_encoder=text_encoder, dtype=DTYPE
-    )
+    pipe = LTX2InContextPipeline.from_pretrained(DISTILLED_BASE_REPO if distilled else BASE_REPO, torch_dtype=DTYPE)
     # Kept as togglable adapters (not fused): stage 1 uses only the IC-LoRA, stage 2 only the distilled one.
     _load_lora(pipe, model_path, LORA_FILE, "inpaint")
     if not distilled:
         _load_lora(pipe, LTX_REPO, DISTILLED_LORA_FILE, "distilled")
         pipe.set_adapters(["inpaint"], [1.0])
     pipe.vae.enable_tiling()
-    _offload(pipe)
+    pipe.enable_sequential_cpu_offload(device="cuda")
+    upsample_pipe = LTX2LatentUpsamplePipeline(vae=pipe.vae, latent_upsampler=_load_upsampler().to("cuda"))
     # As in diffusers' recipe: stage 2 sigmas are used as given, without the dev scheduler's time shift.
     refine_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         pipe.scheduler.config, use_dynamic_shifting=False, shift_terminal=None
     )
-    return {"pipe": pipe, "distilled": distilled, "refine_scheduler": refine_scheduler, "upsampler": _load_upsampler()}
+    return {"pipe": pipe, "distilled": distilled, "refine_scheduler": refine_scheduler, "upsample_pipe": upsample_pipe}
 
 
 def _load_lora(pipe, repo, weight_name, adapter_name):
@@ -89,42 +76,14 @@ def _load_lora(pipe, repo, weight_name, adapter_name):
         raise RuntimeError(f"{weight_name} attached to {attached} of its {expected} layers")
 
 
-def _offload(pipe):
-    """Stream the big models (dev + distilled LoRA alone exceed 24 GB); keep the small ones on the GPU."""
-    for module in (pipe.transformer, pipe.connectors):
-        module.enable_group_offload(onload_device=torch.device("cuda"), offload_type="leaf_level", use_stream=True)
-    for module in (pipe.vae, pipe.audio_vae, pipe.vocoder):
-        module.to("cuda")
-    # The 4-bit text encoder is placed on the GPU by bitsandbytes at load and cannot be moved.
-
-
 def _load_upsampler():
-    """LTX-2.3's 2x latent upsampler; its single file uses a plain conv resampler, not diffusers' rational one."""
+    """LTX-2.3's 2x latent upsampler (x2 1.1); no diffusers-format release exists, so build it from the file's config."""
     upsampler = LTX2LatentUpsamplerModel(
         in_channels=128, mid_channels=1024, num_blocks_per_stage=4, dims=3,
         spatial_upsample=True, temporal_upsample=False, use_rational_resampler=False,
     )
     upsampler.load_state_dict(load_file(hf_hub_download(LTX_REPO, UPSAMPLER_FILE)), strict=True)
     return upsampler.to(DTYPE).eval()
-
-
-def _convert_ltx23_transformer(checkpoint, **kwargs):
-    """diffusers' single-file converter predates LTX-2.3: it misses the prompt_adaln rename."""
-    converted = convert_ltx2_transformer_to_diffusers(checkpoint, **kwargs)
-    return {key.replace("prompt_adaln_single", "prompt_adaln"): value for key, value in converted.items()}
-
-
-def _load_transformer(transformer_file, base_repo):
-    # Patches diffusers' global converter entry; the rename is a no-op for older LTX-2 checkpoints.
-    loadable = SINGLE_FILE_LOADABLE_CLASSES["LTX2VideoTransformer3DModel"]
-    loadable["checkpoint_mapping_fn"] = _convert_ltx23_transformer
-    return LTX2VideoTransformer3DModel.from_single_file(
-        hf_hub_download(TRANSFORMER_REPO, transformer_file),
-        quantization_config=GGUFQuantizationConfig(compute_dtype=DTYPE),
-        config=base_repo,
-        subfolder="transformer",
-        dtype=DTYPE,
-    )
 
 
 def inpaint_video(video, masks, model, prompt=None, seed=0, long_side=768, fps=24, dilate_px=15, feather_px=6):
@@ -218,11 +177,10 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
 
     # Stage 2: keep the original outside the mask, upsample 2x in latent space, then refine.
     composited = np.where(gen_masks[..., None], _decode(pipe, video_latent), frames)
-    upsampler = model["upsampler"].to("cuda")
-    try:
-        upsampled = upsampler(_encode(pipe, composited).to(DTYPE))
-    finally:
-        upsampler.to("cpu")
+    upsampled = model["upsample_pipe"](
+        video=[Image.fromarray(f) for f in composited], height=height, width=width,
+        generator=generator, output_type="latent", return_dict=False,
+    )[0]
     with _refining(model):
         refined, _ = pipe(
             latents=upsampled, audio_latents=audio_latent, width=width * 2, height=height * 2,
@@ -257,12 +215,6 @@ def _decode(pipe, latents):
     video = pipe.vae.decode(latents.to(pipe.vae.dtype), return_dict=False)[0]
     video = pipe.video_processor.postprocess_video(video, output_type="np")[0]
     return (np.clip(video, 0, 1) * 255).round().astype(np.uint8)
-
-
-def _encode(pipe, frames):
-    """(F, H, W, 3) uint8 RGB frames -> latents in the form the pipeline returns and accepts."""
-    pixels = pipe.video_processor.preprocess_video([Image.fromarray(f) for f in frames])
-    return retrieve_latents(pipe.vae.encode(pixels.to("cuda", pipe.vae.dtype)), sample_mode="argmax")
 
 
 def _composite(video, masks, generated, feather_px):
