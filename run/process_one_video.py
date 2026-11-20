@@ -3,6 +3,7 @@
 python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out out.mp4
 python -m run.process_one_video --video in.mp4 --masklet-prompt "dog" --prompt "a red fox" --out out.mp4
 python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out out.mp4 --dev  # experimental: dev + CFG, off the IC-LoRA recipe
+python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out preview.mp4 --first-window  # quick preview
 """
 import argparse
 
@@ -21,6 +22,7 @@ def parse_args():
     parser.add_argument("--long-side", type=int, default=512, help="cap on stage-1 size; stage 2 renders at 2x")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dev", action="store_true", help="experimental: the IC-LoRA for inpainting is meant for use with the distilled ltx, not dev")
+    parser.add_argument("--first-window", action="store_true", help="render only the first window (a short preview)")
     args = parser.parse_args()
     check_masklet_args(parser, args, outputs=[args.out, *([args.save_masks] if args.save_masks else [])])
     return args
@@ -37,7 +39,8 @@ def main():
         raise SystemExit("masks are empty; nothing to inpaint")
     model = get_video_model(distilled=not args.dev)
     inpainted = inpaint_video(
-        video, masks, model, prompt=args.prompt, seed=args.seed, long_side=args.long_side, fps=fps
+        video, masks, model, prompt=args.prompt, seed=args.seed, long_side=args.long_side, fps=fps,
+        first_window_only=args.first_window,
     )
     write_video(args.out, inpainted, fps)
     print(f"wrote {args.out}")
