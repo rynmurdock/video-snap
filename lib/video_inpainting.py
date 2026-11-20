@@ -94,20 +94,21 @@ def _load_upsampler():
 
 
 def inpaint_video(
-        video, masks, model, prompt=None, seed=0, long_side=768, fps=24, dilate_px=15, feather_px=6,
+        video, masks, model, prompt=None, seed=0, long_side=768, fps=24, dilate_px=30, feather_px=6,
         window=None, overlap=OVERLAP_FRAMES, first_window_only=False,
         ):
     """Regenerate the masked region; returns a video shaped like the input (or its first window).
 
     `prompt` should describe only the masked region (None works for removal).
     `long_side` caps the stage-1 generation size; stage 2 refines at twice that.
-    `dilate_px` grows the mask at stage-1 size so the fill covers the object's edges.
+    `dilate_px` grows the mask (in source pixels) so the fill covers the object's edges.
     `window`/`overlap` (8k + 1 frames) split long videos; window None fits the 4090 at this size.
     `first_window_only` renders just the first window and returns only its frames, for quick previews.
     """
     check_video(video)
     if masks.shape != video.shape[:3]:
         raise ValueError(f"masks must be (T, H, W) = {video.shape[:3]}, got {masks.shape}")
+    masks = dilate_masks(masks, dilate_px)
     long_side = _stage_1_long_side(video.shape[1:3], long_side)
     window = window or _window_frames(*_generation_size(*video.shape[1:3], long_side), overlap)
     spans = _windows(len(video), window, overlap)
@@ -117,7 +118,7 @@ def inpaint_video(
     out = np.empty_like(video[:spans[-1][1]])
     context = None
     for i, (start, stop) in enumerate(tqdm(spans, desc="windows", unit="window")):
-        frames, gen_masks = _prepare(video[start:stop], masks[start:stop], long_side, dilate_px)
+        frames, gen_masks = _prepare(video[start:stop], masks[start:stop], long_side)
         stage_1, stage_2 = _generate(frames, gen_masks, model, encoded_prompt, seed + i, fps, context)
         real = stop - start  # drop the 8k + 1 padding frames
         stage_1, stage_2 = stage_1[:real], stage_2[:real]
@@ -168,8 +169,8 @@ def _generation_size(height, width, long_side):
     return tuple(max(SIZE_STEP, round(side * scale / SIZE_STEP) * SIZE_STEP) for side in (height, width))
 
 
-def _prepare(video, masks, long_side, dilate_px=0):
-    """Resize to generation size (RGB), pad the frame count to 8k + 1, and dilate the masks."""
+def _prepare(video, masks, long_side):
+    """Resize to generation size (RGB) and pad the frame count to 8k + 1."""
     num_frames = len(video)
     padded = -(-(num_frames - 1) // FRAME_STEP) * FRAME_STEP + 1
     index = np.minimum(np.arange(padded), num_frames - 1)
@@ -181,10 +182,15 @@ def _prepare(video, masks, long_side, dilate_px=0):
     # Area-resize then threshold at zero, so thin masked structures survive the downscale.
     binary = (np.asarray(masks) > 0).astype(np.float32)
     gen_masks = np.stack([
-        _dilate(cv2.resize(binary[i], (width, height), interpolation=cv2.INTER_AREA) > 0, dilate_px)
+        cv2.resize(binary[i], (width, height), interpolation=cv2.INTER_AREA) > 0
         for i in index
     ])
     return frames, gen_masks
+
+
+def dilate_masks(masks, px):
+    """Grow (T, H, W) masks by `px` pixels with an elliptical kernel; returns uint8 0/255."""
+    return np.stack([_dilate(m > 0, px) for m in masks]).astype(np.uint8) * 255
 
 
 def _dilate(mask, px):

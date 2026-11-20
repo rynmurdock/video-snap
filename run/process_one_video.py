@@ -20,6 +20,7 @@ def parse_args():
     parser.add_argument("--out", required=True)
     parser.add_argument("--prompt", default=None, help="describe only the masked region")
     parser.add_argument("--long-side", type=int, default=512, help="cap on stage-1 size; stage 2 renders at 2x")
+    parser.add_argument("--dilate-px", type=int, default=30, help="grow masks by this many source pixels")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--distilled", action="store_true", help="use the fast distilled LTX instead of dev + distilled-LoRA refine")
     parser.add_argument("--first-window", action="store_true", help="render only the first window (a short preview)")
@@ -40,7 +41,7 @@ def main():
     model = get_video_model(distilled=args.distilled)
     inpainted = inpaint_video(
         video, masks, model, prompt=args.prompt, seed=args.seed, long_side=args.long_side, fps=fps,
-        first_window_only=args.first_window,
+        dilate_px=args.dilate_px, first_window_only=args.first_window,
     )
     write_video(args.out, inpainted, fps)
     print(f"wrote {args.out}")

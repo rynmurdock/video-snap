@@ -13,7 +13,7 @@ import lib.video_inpainting as video_inpainting
 import run.process_one_video  # noqa: F401 (import check)
 from lib.masklets import compose_masklets, free_model, get_masklet_model, make_masklets
 from lib.video_inpainting import (
-    _composite, _prepare, _stage_1_long_side, _window_frames, _windows, get_video_model, inpaint_video,
+    _composite, _prepare, dilate_masks, _stage_1_long_side, _window_frames, _windows, get_video_model, inpaint_video,
 )
 from lib.video_io import write_video
 from run.make_masklets import collect_masks
@@ -82,6 +82,13 @@ def test_stitch():
     assert (first == video[:17]).all()
 
 
+def test_dilate():
+    masks = np.zeros((2, 64, 64), np.uint8)
+    masks[:, 32, 32] = 255
+    grown = dilate_masks(masks, 5)
+    assert grown.dtype == np.uint8 and grown[:, 32, 37].all() and not grown[:, 32, 38].any()
+
+
 def test_compose():
     a, b = np.zeros((2, 4, 4), np.uint8), np.zeros((2, 4, 4), np.uint8)
     a[:, :2], b[:, :, :2] = 255, 255
@@ -127,6 +134,7 @@ if __name__ == "__main__":
     test_shapes()
     test_windows()
     test_stitch()
+    test_dilate()
     test_compose()
     test_mask_file_round_trip()
     if "--full" in sys.argv:
