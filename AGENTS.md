@@ -22,3 +22,7 @@ Try to keep your responses brief & to-the-point. Do not provide lists of "not bu
 When you provide info like branch names, bold them. 
 
 Do not run the full smoke tests on your side; run tests sans GPU unless requested.
+
+Always pull from the most recent local branch (typically `main`).
+
+No closing summaries; a one-line result iff there is an actual result.
