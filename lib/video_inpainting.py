@@ -1,7 +1,8 @@
 """Mask-conditioned video inpainting with the LTX-2.3 In/Outpainting IC-LoRA.
 
 Videos are cv2 arrays: (T, H, W, 3) uint8 BGR. Masks are (T, H, W), nonzero = inpaint.
-Follows Lightricks' official two-stage inpaint workflow (green-keyed reference, pixel 2x refine).
+Follows diffusers' LTX-2 two-stage recipe: IC-LoRA generation from a green-keyed reference, 2x latent upsample,
+then a 3-step refine (dev + distilled LoRA by default; the distilled model with `distilled=True`).
 Long videos run in overlapping windows; each window is pinned to the previous one's overlap frames.
 """
 import contextlib
@@ -12,6 +13,7 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler, LTX2InContextPipeline
 from diffusers.models.latent_upscaler.latent_upscaler_ltx2 import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2 import LTX2LatentUpsamplePipeline
+from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
 from diffusers.pipelines.ltx2.pipeline_ltx2_ic_lora import LTX2ReferenceCondition
 from diffusers.pipelines.ltx2.utils import (
     DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
@@ -35,7 +37,17 @@ FRAME_STEP = 8  # the VAE compresses time 8x, so frame counts must be 8k + 1
 SIZE_STEP = 32
 MIN_STAGE_1_LONG_SIDE = 256  # below this LTX output degrades; tiny clips render above source size
 GREEN_RGB = (102, 255, 0)  # the IC-LoRA was trained with masked pixels painted this key colour
-STAGE_2_SIGMAS = [0.725, 0.421875]  # the official workflow's refine schedule
+DEV_STEPS = 30
+# diffusers' recommended LTX-2.3 guidance for the dev model (the pipeline's own defaults).
+DEV_GUIDANCE = dict(
+    guidance_scale=3.0, stg_scale=1.0, modality_scale=3.0, guidance_rescale=0.7, spatio_temporal_guidance_blocks=[28],
+    audio_guidance_scale=7.0, audio_stg_scale=1.0, audio_modality_scale=3.0, audio_guidance_rescale=0.7,
+)
+# Distilled weights run unguided; every audio knob too, since audio CFG > 1 alone switches CFG on.
+NO_GUIDANCE = dict(
+    guidance_scale=1.0, stg_scale=0.0, modality_scale=1.0, guidance_rescale=0.0,
+    audio_guidance_scale=1.0, audio_stg_scale=0.0, audio_modality_scale=1.0, audio_guidance_rescale=0.0,
+)
 # Stage-2 latent tokens per window: 97 frames (13 latent) of 1080p (28x48 tokens) is the measured-safe 4090 point.
 STAGE_2_TOKEN_BUDGET = 13 * 28 * 48
 MAX_WINDOW_FRAMES = 121  # measured to fit at 1080p (21.3G); also caps small sources near LTX's usual lengths
@@ -80,7 +92,10 @@ def _load_upsampler():
     return upsampler.to(DTYPE).eval()
 
 
-def inpaint_video(video, masks, model, prompt=None, seed=0, long_side=768, fps=24, dilate_px=15, feather_px=6):
+def inpaint_video(
+        video, masks, model, prompt=None, seed=0, long_side=768, fps=24, dilate_px=15, feather_px=6,
+        window=None, overlap=OVERLAP_FRAMES,
+        ):
     """Regenerate the masked region; returns a video shaped like the input.
 
     `prompt` should describe only the masked region (None works for removal).
@@ -184,8 +199,8 @@ def _resize_masks(masks, size):
 
 @torch.inference_mode()
 def _encode_prompt(pipe, prompt):
-    prompt_embeds, prompt_mask, _, _ = pipe.encode_prompt(prompt, do_classifier_free_guidance=False, device="cuda")
-    return prompt_embeds, prompt_mask
+    """(prompt embeds, mask, negative embeds, mask); the negative is used only by dev's guided stage 1."""
+    return pipe.encode_prompt(prompt, negative_prompt=DEFAULT_NEGATIVE_PROMPT, device="cuda")
 
 
 @torch.inference_mode()
@@ -194,17 +209,16 @@ def _generate(frames, gen_masks, model, encoded_prompt, seed, fps, context=None)
 
     `context` = (stage-1, stage-2) frames from the previous window; they are pinned as this window's start.
     """
-    pipe = model["pipe"]
+    pipe, distilled = model["pipe"], model["distilled"]
     num_frames, height, width = gen_masks.shape
     generator = torch.Generator("cuda").manual_seed(seed)
-    prompt_embeds, prompt_mask = encoded_prompt
+    prompt_embeds, prompt_mask, negative_embeds, negative_mask = encoded_prompt
     pins = [None, None]
     if context is not None:
         # The overlap shows the previous result un-greened, and conditioning keeps its latents clean.
         frames, gen_masks = frames.copy(), gen_masks.copy()
         frames[: len(context[0])], gen_masks[: len(context[0])] = context[0], False
         pins = [[LTX2VideoCondition(frames=f, index=0, strength=1.0)] for f in context]
-    # Every guidance knob off: the distilled model is meant to run unguided.
     shared = dict(
         prompt_embeds=prompt_embeds, prompt_attention_mask=prompt_mask, num_frames=num_frames, frame_rate=fps,
         generator=generator, output_type="latent", return_dict=False,
@@ -214,32 +228,29 @@ def _generate(frames, gen_masks, model, encoded_prompt, seed, fps, context=None)
     reference = frames.copy()
     reference[gen_masks] = GREEN_RGB
     if distilled:
-        stage_1 = dict(sigmas=DISTILLED_SIGMA_VALUES, num_inference_steps=len(DISTILLED_SIGMA_VALUES), **NO_GUIDANCE)
+        schedule = dict(sigmas=DISTILLED_SIGMA_VALUES, num_inference_steps=len(DISTILLED_SIGMA_VALUES), **NO_GUIDANCE)
     else:
-        stage_1 = dict(
+        schedule = dict(
             num_inference_steps=DEV_STEPS, negative_prompt_embeds=negative_embeds,
             negative_prompt_attention_mask=negative_mask, **DEV_GUIDANCE,
         )
     video_latent, audio_latent = pipe(
         reference_conditions=[LTX2ReferenceCondition(frames=[Image.fromarray(f) for f in reference])],
-        conditions=pins[0], reference_downscale_factor=1, width=width, height=height,
-        sigmas=DISTILLED_SIGMA_VALUES, num_inference_steps=len(DISTILLED_SIGMA_VALUES), **shared,
+        conditions=pins[0], reference_downscale_factor=1, width=width, height=height, **schedule, **shared,
     )
 
     # Stage 2: keep the original outside the mask, upsample 2x in latent space, then refine.
-    composited = np.where(gen_masks[..., None], _decode(pipe, video_latent), frames)
+    stage_1 = np.where(gen_masks[..., None], _decode(pipe, video_latent), frames)
     upsampled = model["upsample_pipe"](
-        video=[Image.fromarray(f) for f in composited], height=height, width=width,
+        video=[Image.fromarray(f) for f in stage_1], height=height, width=width,
         generator=generator, output_type="latent", return_dict=False,
     )[0]
     with _refining(model):
         refined, _ = pipe(
-            latents=_encode(pipe, upscaled), audio_latents=audio_latent, conditions=pins[1],
-            width=width * 2, height=height * 2,
-            sigmas=STAGE_2_SIGMAS, num_inference_steps=len(STAGE_2_SIGMAS), **shared,
+            latents=upsampled, audio_latents=audio_latent, conditions=pins[1], width=width * 2, height=height * 2,
+            sigmas=STAGE_2_DISTILLED_SIGMA_VALUES, num_inference_steps=len(STAGE_2_DISTILLED_SIGMA_VALUES),
+            noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0], **NO_GUIDANCE, **shared,
         )
-    finally:
-        pipe.enable_lora()
     return stage_1, _decode(pipe, refined)
 
 
