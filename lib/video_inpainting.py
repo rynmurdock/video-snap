@@ -22,7 +22,7 @@ from lib.video_io import check_video
 BASE_REPO = "diffusers/LTX-2.3-Diffusers"
 DISTILLED_BASE_REPO = "diffusers/LTX-2.3-Distilled-Diffusers"
 TRANSFORMER_REPO = "QuantStack/LTX-2.3-GGUF"
-TRANSFORMER_FILE = "LTX-2.3-1.1/LTX-2.3-22B-1.1-Q4_K_M.gguf"
+TRANSFORMER_FILE = "LTX-2.3-dev/LTX-2.3-dev-Q4_K_M.gguf"  # no 1.1 dev release exists; distilled is 1.1
 DISTILLED_TRANSFORMER_FILE = "LTX-2.3-distilled-1.1/LTX-2.3-22B-distilled-1.1-Q4_K_M.gguf"
 TEXT_ENCODER_REPO = "unsloth/gemma-3-12b-it-qat-bnb-4bit"
 LORA_FILE = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
