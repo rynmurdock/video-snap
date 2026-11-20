@@ -2,7 +2,7 @@
 
 python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out out.mp4
 python -m run.process_one_video --video in.mp4 --masklet-prompt "dog" --prompt "a red fox" --out out.mp4
-python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out out.mp4 --distilled  # faster, lower quality
+python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out out.mp4 --dev  # experimental: dev + CFG, off the IC-LoRA recipe
 """
 import argparse
 
@@ -20,7 +20,7 @@ def parse_args():
     parser.add_argument("--prompt", default=None, help="describe only the masked region")
     parser.add_argument("--long-side", type=int, default=512, help="cap on stage-1 size; stage 2 renders at 2x")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--distilled", action="store_true", help="use the fast distilled LTX instead of dev + distilled-LoRA refine")
+    parser.add_argument("--dev", action="store_true", help="experimental: dev LTX + CFG instead of the distilled base the IC-LoRA targets")
     args = parser.parse_args()
     check_masklet_args(parser, args, outputs=[args.out, *([args.save_masks] if args.save_masks else [])])
     return args
@@ -35,7 +35,7 @@ def main():
         write_video(args.save_masks, masks, fps)
     if not masks.any():
         raise SystemExit("masks are empty; nothing to inpaint")
-    model = get_video_model(distilled=args.distilled)
+    model = get_video_model(distilled=not args.dev)
     inpainted = inpaint_video(
         video, masks, model, prompt=args.prompt, seed=args.seed, long_side=args.long_side, fps=fps
     )

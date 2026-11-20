@@ -2,7 +2,8 @@
 
 Videos are cv2 arrays: (T, H, W, 3) uint8 BGR. Masks are (T, H, W), nonzero = inpaint.
 Follows diffusers' LTX-2 two-stage recipe: IC-LoRA generation from a green-keyed reference, 2x latent upsample,
-then a 3-step refine (dev + distilled LoRA by default; the distilled model with `distilled=True`).
+then a 3-step refine. Defaults to the distilled base, the only one Lightricks supports for this IC-LoRA;
+`distilled=False` runs dev + CFG with a distilled-LoRA refine (off-recipe, experimental).
 Long videos run in overlapping windows; each window is pinned to the previous one's overlap frames.
 """
 import contextlib
@@ -55,8 +56,8 @@ MAX_WINDOW_FRAMES = 121  # measured to fit at 1080p (21.3G); also caps small sou
 OVERLAP_FRAMES = 25  # 4 latent frames, ~1 s of shared context between windows
 
 
-def get_video_model(model_path="Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", distilled=False):
-    """Load the inpainting models; `model_path` is the IC-LoRA repo, `distilled` picks the fast base model."""
+def get_video_model(model_path="Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", distilled=True):
+    """Load the inpainting models; `model_path` is the IC-LoRA repo, `distilled=False` swaps in the (experimental) dev base."""
     pipe = LTX2InContextPipeline.from_pretrained(DISTILLED_BASE_REPO if distilled else BASE_REPO, torch_dtype=DTYPE)
     # Kept as togglable adapters (not fused): stage 1 uses only the IC-LoRA, stage 2 only the distilled one.
     _load_lora(pipe, model_path, LORA_FILE, "inpaint")
