@@ -22,7 +22,7 @@ def add_masklet_args(parser):
                         help="SAM3 text prompt for a region to mask, e.g. 'dog'; repeat for several")
     parser.add_argument("--compose", choices=COMPOSE_OPS, default="union",
                         help="how to combine masklets; subtract = first minus the rest (--masks come first)")
-    parser.add_argument("--max-frames", type=positive_int, default=97)
+    parser.add_argument("--max-frames", type=positive_int, default=None, help="default: the whole video")
 
 
 def check_masklet_args(parser, args, outputs):

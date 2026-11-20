@@ -9,9 +9,12 @@ from pathlib import Path
 
 import numpy as np
 
+import lib.video_inpainting as video_inpainting
 import run.process_one_video  # noqa: F401 (import check)
 from lib.masklets import compose_masklets, free_model, get_masklet_model, make_masklets
-from lib.video_inpainting import _composite, _prepare, _stage_1_long_side, get_video_model, inpaint_video
+from lib.video_inpainting import (
+    _composite, _prepare, _stage_1_long_side, _window_frames, _windows, get_video_model, inpaint_video,
+)
 from lib.video_io import write_video
 from run.make_masklets import collect_masks
 
@@ -33,6 +36,47 @@ def test_shapes():
     out = _composite(video, masks, generated, feather_px=0)
     assert out.shape == video.shape and out.dtype == np.uint8
     assert (out[masks > 0] == 0).all() and (out[masks == 0] == video[masks == 0]).all()
+
+
+def test_windows():
+    for n, window, overlap in [(98, 97, 25), (97, 97, 25), (25, 97, 25), (300, 97, 25), (40, 17, 9)]:
+        spans = _windows(n, window, overlap)
+        assert spans[0][0] == 0 and spans[-1][1] == n
+        assert all(stop - start <= window for start, stop in spans)
+        assert all(prev[1] - cur[0] == overlap for prev, cur in zip(spans, spans[1:]))
+    assert _windows(25, 97, 25) == [(0, 25)] and _windows(98, 97, 25) == [(0, 97), (72, 98)]
+    for window, overlap in [(96, 25), (97, 24), (25, 25), (33, 33)]:
+        try:
+            _windows(100, window, overlap)
+        except ValueError:
+            continue
+        raise AssertionError(f"window={window} overlap={overlap} should raise")
+    assert _window_frames(448, 768) == 97 and _window_frames(128, 256) == 121
+
+
+def _identity_generate(frames, gen_masks, model, encoded_prompt, seed, fps, context=None):
+    """Stands in for LTX: returns the input, with the overlap pinned to `context` like the real model."""
+    stage_1 = frames.copy()
+    if context is not None:
+        stage_1[: len(context[0])] = context[0]
+    stage_2 = stage_1.repeat(2, axis=1).repeat(2, axis=2)
+    if context is not None:
+        stage_2[: len(context[1])] = context[1]
+    return stage_1, stage_2
+
+
+def test_stitch():
+    """Windows with an identity model must reproduce the input exactly (spans, colours, crossfade)."""
+    video = np.zeros((40, 64, 128, 3), np.uint8)
+    video[...] = np.arange(40, dtype=np.uint8)[:, None, None, None] * np.array([1, 3, 5], np.uint8)
+    real = video_inpainting._generate, video_inpainting._encode_prompt
+    video_inpainting._generate, video_inpainting._encode_prompt = _identity_generate, lambda *_: None
+    try:
+        out = inpaint_video(video, np.full(video.shape[:3], 255, np.uint8), {"pipe": None},
+                            long_side=128, dilate_px=0, feather_px=0, window=17, overlap=9)
+    finally:
+        video_inpainting._generate, video_inpainting._encode_prompt = real
+    assert (out == video).all()
 
 
 def test_compose():
@@ -61,19 +105,30 @@ def test_full_masklets():
     assert all(m.shape == video.shape[:3] and m.dtype == np.uint8 for m in masklets.values())
 
 
-def test_full_model():
+def test_full_model(model):
     video, masks = synthetic_clip()
-    out = inpaint_video(video, masks, get_video_model(distilled=True), long_side=256)
+    out = inpaint_video(video, masks, model, long_side=256)
     assert out.shape == video.shape and out.dtype == np.uint8
     assert (out[:, :10] == video[:, :10]).all(), "pixels far from the mask must be untouched"
     assert (out[masks > 0] != video[masks > 0]).any(), "masked pixels must be regenerated"
 
 
+def test_full_windows(model):
+    video, masks = synthetic_clip(num_frames=40)
+    out = inpaint_video(video, masks, model, long_side=256, window=17, overlap=9)
+    assert out.shape == video.shape and out.dtype == np.uint8
+    assert (out[:, :10] == video[:, :10]).all(), "pixels far from the mask must be untouched"
+
+
 if __name__ == "__main__":
     test_shapes()
+    test_windows()
+    test_stitch()
     test_compose()
     test_mask_file_round_trip()
     if "--full" in sys.argv:
         test_full_masklets()
-        test_full_model()
+        model = get_video_model()
+        test_full_model(model)
+        test_full_windows(model)
     print("smoke ok")
