@@ -18,9 +18,9 @@ from transformers import Gemma3ForConditionalGeneration
 from lib.video_io import check_video
 
 # Quantized weights: the full-precision model (95 GB, 38 GB transformer) does not fit a 4090.
-BASE_REPO = "diffusers/LTX-2.3-Distilled-Diffusers"
+BASE_REPO = "diffusers/LTX-2.3-Diffusers"
 TRANSFORMER_REPO = "QuantStack/LTX-2.3-GGUF"
-TRANSFORMER_FILE = "LTX-2.3-distilled-1.1/LTX-2.3-22B-distilled-1.1-Q4_K_M.gguf"
+TRANSFORMER_FILE = "LTX-2.3-1.1/LTX-2.3-22B-1.1-Q4_K_M.gguf"
 TEXT_ENCODER_REPO = "unsloth/gemma-3-12b-it-qat-bnb-4bit"
 LORA_FILE = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
 
@@ -80,7 +80,7 @@ def inpaint_video(video, masks, model, prompt=None, seed=0, long_side=768, fps=2
         raise ValueError(f"masks must be (T, H, W) = {video.shape[:3]}, got {masks.shape}")
     long_side = _stage_1_long_side(video.shape[1:3], long_side)
     frames, gen_masks = _prepare(video, masks, long_side, dilate_px)
-    generated = _generate(frames, gen_masks, model, prompt or "", seed, fps)
+    generated = _generate(frames, gen_masks, model, prompt or "The scene", seed, fps)
     return _composite(video, _resize_masks(gen_masks[: len(video)], video.shape[1:3]), generated, feather_px)
 
 
@@ -138,7 +138,7 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
     # Every guidance knob off: the distilled model is meant to run unguided.
     shared = dict(
         prompt_embeds=prompt_embeds, prompt_attention_mask=prompt_mask, num_frames=num_frames, frame_rate=fps,
-        guidance_scale=1.0, stg_scale=0.0, modality_scale=1.0, guidance_rescale=0.0,
+        guidance_scale=1.4, stg_scale=0.0, modality_scale=1.0, guidance_rescale=0.0,
         audio_guidance_scale=1.0, audio_stg_scale=0.0, audio_modality_scale=1.0, audio_guidance_rescale=0.0,
         generator=generator, output_type="latent", return_dict=False,
     )
@@ -149,8 +149,7 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
     pipe.enable_lora()
     video_latent, audio_latent = pipe(
         reference_conditions=[LTX2ReferenceCondition(frames=[Image.fromarray(f) for f in reference])],
-        reference_downscale_factor=1, width=width, height=height,
-        sigmas=DISTILLED_SIGMA_VALUES, num_inference_steps=len(DISTILLED_SIGMA_VALUES), **shared,
+        reference_downscale_factor=1, width=width, height=height, **shared,
     )
 
     # Stage 2: keep the original outside the mask, upscale 2x in pixels, then a short refine.

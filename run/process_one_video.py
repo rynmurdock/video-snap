@@ -17,7 +17,7 @@ def parse_args():
     parser.add_argument("--save-masks", default=None, help="also write the composed mask video here")
     parser.add_argument("--out", required=True)
     parser.add_argument("--prompt", default=None, help="describe only the masked region")
-    parser.add_argument("--long-side", type=int, default=768, help="cap on stage-1 size; stage 2 renders at 2x")
+    parser.add_argument("--long-side", type=int, default=512, help="cap on stage-1 size; stage 2 renders at 2x")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     check_masklet_args(parser, args, outputs=[args.out, *([args.save_masks] if args.save_masks else [])])
