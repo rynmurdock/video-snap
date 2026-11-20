@@ -1,15 +1,16 @@
-
 # Setup
-```
+
+```bash
 uv venv
 source ./.venv/bin/activate
 uv pip install -r requirements.txt
 uv pip install -e .
 hf auth login   # after accepting the IC-LoRA & SAM3 licenses linked below
 ```
+
 # Inpaint a video
 
-```
+```bash
 python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out out.mp4
 ```
 
@@ -22,7 +23,8 @@ python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out out.mp4
 - Output is silent mp4v at the source fps; for variable-frame-rate input, convert first: `ffmpeg -i in.mp4 -vf fps=24 cfr.mp4`.
 
 # Masklets from text prompts (SAM3)
-```
+
+```bash
 python -m run.process_one_video --video in.mp4 --masklet-prompt "dog" --prompt "a red fox" --out out.mp4
 python -m run.make_masklets --video in.mp4 --masklet-prompt "dog" --out dog.mp4
 ```
@@ -31,10 +33,19 @@ python -m run.make_masklets --video in.mp4 --masklet-prompt "dog" --out dog.mp4
 - Repeat `--masklet-prompt` & pass several `--masks` to compose them.
 - `--compose union|intersect|subtract`; subtract = first minus the rest, with `--masks` ordered before prompts:
 
-python -m run.process_one_video --video /home/ryn_mote/Misc/INTERMARCHE_TEST.mp4 --masklet-prompt "person" --save-masks body.mp4 --out out.mp4
+```bash
+python -m run.make_masklets --video in.mp4 --masks person.mp4 --masklet-prompt "face" --compose subtract --out body.mp4
+```
+
+- `--save-masks` also writes the composed mask video:
+
+```bash
+python -m run.process_one_video --video in.mp4 --masklet-prompt "person" --save-masks body.mp4 --out out.mp4
+```
 
 # Smoke test
-```
+
+```bash
 python -m tests.smoke          # imports, shapes, mask files: seconds, no GPU
 python -m tests.smoke --full   # runs SAM3 + LTX (GPU, gated weights): minutes
 ```
