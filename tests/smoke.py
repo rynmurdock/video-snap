@@ -71,12 +71,15 @@ def test_stitch():
     video[...] = np.arange(40, dtype=np.uint8)[:, None, None, None] * np.array([1, 3, 5], np.uint8)
     real = video_inpainting._generate, video_inpainting._encode_prompt
     video_inpainting._generate, video_inpainting._encode_prompt = _identity_generate, lambda *_: None
+    kwargs = dict(long_side=128, dilate_px=0, feather_px=0, window=17, overlap=9)
+    masks = np.full(video.shape[:3], 255, np.uint8)
     try:
-        out = inpaint_video(video, np.full(video.shape[:3], 255, np.uint8), {"pipe": None},
-                            long_side=128, dilate_px=0, feather_px=0, window=17, overlap=9)
+        out = inpaint_video(video, masks, {"pipe": None}, **kwargs)
+        first = inpaint_video(video, masks, {"pipe": None}, first_window_only=True, **kwargs)
     finally:
         video_inpainting._generate, video_inpainting._encode_prompt = real
     assert (out == video).all()
+    assert (first == video[:17]).all()
 
 
 def test_compose():
