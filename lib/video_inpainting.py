@@ -1,19 +1,28 @@
 """Mask-conditioned video inpainting with the LTX-2.3 In/Outpainting IC-LoRA.
 
 Videos are cv2 arrays: (T, H, W, 3) uint8 BGR. Masks are (T, H, W), nonzero = inpaint.
-Follows Lightricks' official two-stage inpaint workflow (green-keyed reference, pixel 2x refine).
-Runs the full (undistilled) LTX-2.3 by default; `get_video_model(distilled=True)` swaps in the fast distilled one.
+Follows diffusers' LTX-2 two-stage recipe: IC-LoRA generation from a green-keyed reference, 2x latent upsample,
+then a 3-step refine (dev + distilled LoRA by default; the distilled model with `distilled=True`).
 """
+import contextlib
+
 import cv2
 import numpy as np
 import torch
-from diffusers import GGUFQuantizationConfig, LTX2InContextPipeline, LTX2VideoTransformer3DModel
+from diffusers import (
+    FlowMatchEulerDiscreteScheduler, GGUFQuantizationConfig, LTX2InContextPipeline, LTX2VideoTransformer3DModel
+)
 from diffusers.loaders.single_file_model import SINGLE_FILE_LOADABLE_CLASSES
 from diffusers.loaders.single_file_utils import convert_ltx2_transformer_to_diffusers
+from diffusers.models.latent_upscaler.latent_upscaler_ltx2 import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.pipeline_ltx2_ic_lora import LTX2ReferenceCondition, retrieve_latents
-from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+from diffusers.pipelines.ltx2.utils import (
+    DEFAULT_NEGATIVE_PROMPT, DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
+)
 from huggingface_hub import hf_hub_download
 from PIL import Image
+from safetensors import safe_open
+from safetensors.torch import load_file
 from transformers import Gemma3ForConditionalGeneration
 
 from lib.video_io import check_video
@@ -26,33 +35,77 @@ TRANSFORMER_FILE = "LTX-2.3-dev/LTX-2.3-dev-Q4_K_M.gguf"  # no 1.1 dev release e
 DISTILLED_TRANSFORMER_FILE = "LTX-2.3-distilled-1.1/LTX-2.3-22B-distilled-1.1-Q4_K_M.gguf"
 TEXT_ENCODER_REPO = "unsloth/gemma-3-12b-it-qat-bnb-4bit"
 LORA_FILE = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
+LTX_REPO = "Lightricks/LTX-2.3"
+DISTILLED_LORA_FILE = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"  # stage-2 refiner on top of dev
+UPSAMPLER_FILE = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 
 DTYPE = torch.bfloat16
 FRAME_STEP = 8  # the VAE compresses time 8x, so frame counts must be 8k + 1
 SIZE_STEP = 32
 MIN_STAGE_1_LONG_SIDE = 256  # below this LTX output degrades; tiny clips render above source size
 GREEN_RGB = (102, 255, 0)  # the IC-LoRA was trained with masked pixels painted this key colour
-STAGE_2_SIGMAS = [0.725, 0.421875]  # the official workflow's refine schedule
-GUIDANCE_SCALE = 1.4  # light CFG for the undistilled model
-DISTILLED_GUIDANCE_SCALE = 1.0  # the distilled model is meant to run unguided
+DEV_STEPS = 30
+# diffusers' recommended LTX-2.3 guidance for the dev model (the pipeline's own defaults).
+DEV_GUIDANCE = dict(
+    guidance_scale=3.0, stg_scale=1.0, modality_scale=3.0, guidance_rescale=0.7, spatio_temporal_guidance_blocks=[28],
+    audio_guidance_scale=7.0, audio_stg_scale=1.0, audio_modality_scale=3.0, audio_guidance_rescale=0.7,
+)
+# Distilled weights run unguided; every audio knob too, since audio CFG > 1 alone switches CFG on.
+NO_GUIDANCE = dict(
+    guidance_scale=1.0, stg_scale=0.0, modality_scale=1.0, guidance_rescale=0.0,
+    audio_guidance_scale=1.0, audio_stg_scale=0.0, audio_modality_scale=1.0, audio_guidance_rescale=0.0,
+)
 
 
 def get_video_model(model_path="Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", distilled=False):
-    """Load the inpainting pipeline; `model_path` is the IC-LoRA repo, `distilled` picks the fast base model."""
+    """Load the inpainting models; `model_path` is the IC-LoRA repo, `distilled` picks the fast base model."""
     base_repo = DISTILLED_BASE_REPO if distilled else BASE_REPO
     transformer = _load_transformer(DISTILLED_TRANSFORMER_FILE if distilled else TRANSFORMER_FILE, base_repo)
     text_encoder = Gemma3ForConditionalGeneration.from_pretrained(TEXT_ENCODER_REPO, dtype=DTYPE)
     pipe = LTX2InContextPipeline.from_pretrained(
         base_repo, transformer=transformer, text_encoder=text_encoder, dtype=DTYPE
     )
-    # Kept as a togglable adapter (not fused): stage 2 runs on the bare base model.
-    pipe.load_lora_weights(model_path, weight_name=LORA_FILE, adapter_name="inpaint")
-    # A LoRA whose keys match nothing only logs a warning, so check that it attached.
-    if "inpaint" not in pipe.get_list_adapters().get("transformer", []):
-        raise RuntimeError(f"IC-LoRA from {model_path} did not attach to the transformer")
+    # Kept as togglable adapters (not fused): stage 1 uses only the IC-LoRA, stage 2 only the distilled one.
+    _load_lora(pipe, model_path, LORA_FILE, "inpaint")
+    if not distilled:
+        _load_lora(pipe, LTX_REPO, DISTILLED_LORA_FILE, "distilled")
+        pipe.set_adapters(["inpaint"], [1.0])
     pipe.vae.enable_tiling()
-    pipe.enable_model_cpu_offload()
-    return {"pipe": pipe, "distilled": distilled}
+    _offload(pipe)
+    # As in diffusers' recipe: stage 2 sigmas are used as given, without the dev scheduler's time shift.
+    refine_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+        pipe.scheduler.config, use_dynamic_shifting=False, shift_terminal=None
+    )
+    return {"pipe": pipe, "distilled": distilled, "refine_scheduler": refine_scheduler, "upsampler": _load_upsampler()}
+
+
+def _load_lora(pipe, repo, weight_name, adapter_name):
+    """Load a LoRA and check every layer in the file attached; unmatched keys only log a warning."""
+    pipe.load_lora_weights(repo, weight_name=weight_name, adapter_name=adapter_name)
+    with safe_open(hf_hub_download(repo, weight_name), "pt") as f:
+        expected = sum(key.endswith("lora_A.weight") for key in f.keys())
+    attached = sum(adapter_name in getattr(m, "lora_A", {}) for m in pipe.transformer.modules())
+    if attached != expected:
+        raise RuntimeError(f"{weight_name} attached to {attached} of its {expected} layers")
+
+
+def _offload(pipe):
+    """Stream the big models (dev + distilled LoRA alone exceed 24 GB); keep the small ones on the GPU."""
+    for module in (pipe.transformer, pipe.connectors):
+        module.enable_group_offload(onload_device=torch.device("cuda"), offload_type="leaf_level", use_stream=True)
+    for module in (pipe.vae, pipe.audio_vae, pipe.vocoder):
+        module.to("cuda")
+    # The 4-bit text encoder is placed on the GPU by bitsandbytes at load and cannot be moved.
+
+
+def _load_upsampler():
+    """LTX-2.3's 2x latent upsampler; its single file uses a plain conv resampler, not diffusers' rational one."""
+    upsampler = LTX2LatentUpsamplerModel(
+        in_channels=128, mid_channels=1024, num_blocks_per_stage=4, dims=3,
+        spatial_upsample=True, temporal_upsample=False, use_rational_resampler=False,
+    )
+    upsampler.load_state_dict(load_file(hf_hub_download(LTX_REPO, UPSAMPLER_FILE)), strict=True)
+    return upsampler.to(DTYPE).eval()
 
 
 def _convert_ltx23_transformer(checkpoint, **kwargs):
@@ -140,38 +193,63 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
     pipe, distilled = model["pipe"], model["distilled"]
     num_frames, height, width = gen_masks.shape
     generator = torch.Generator("cuda").manual_seed(seed)
-    prompt_embeds, prompt_mask, _, _ = pipe.encode_prompt(prompt, do_classifier_free_guidance=False, device="cuda")
-    # Only plain CFG is used (none for distilled); STG, modality and rescale guidance stay off.
+    prompt_embeds, prompt_mask, negative_embeds, negative_mask = pipe.encode_prompt(
+        prompt, negative_prompt=DEFAULT_NEGATIVE_PROMPT, do_classifier_free_guidance=not distilled, device="cuda"
+    )
     shared = dict(
         prompt_embeds=prompt_embeds, prompt_attention_mask=prompt_mask, num_frames=num_frames, frame_rate=fps,
-        guidance_scale=DISTILLED_GUIDANCE_SCALE if distilled else GUIDANCE_SCALE, stg_scale=0.0, modality_scale=1.0, guidance_rescale=0.0,
-        audio_guidance_scale=1.0, audio_stg_scale=0.0, audio_modality_scale=1.0, audio_guidance_rescale=0.0,
         generator=generator, output_type="latent", return_dict=False,
     )
 
     # Stage 1: the reference shows the scene with the region to fill painted green.
     reference = frames.copy()
     reference[gen_masks] = GREEN_RGB
-    # Distilled runs its fixed few-step schedule; undistilled uses the pipeline's default steps.
-    schedule = dict(sigmas=DISTILLED_SIGMA_VALUES, num_inference_steps=len(DISTILLED_SIGMA_VALUES)) if distilled else {}
-    pipe.enable_lora()
+    if distilled:
+        stage_1 = dict(sigmas=DISTILLED_SIGMA_VALUES, num_inference_steps=len(DISTILLED_SIGMA_VALUES), **NO_GUIDANCE)
+    else:
+        stage_1 = dict(
+            num_inference_steps=DEV_STEPS, negative_prompt_embeds=negative_embeds,
+            negative_prompt_attention_mask=negative_mask, **DEV_GUIDANCE,
+        )
     video_latent, audio_latent = pipe(
         reference_conditions=[LTX2ReferenceCondition(frames=[Image.fromarray(f) for f in reference])],
-        reference_downscale_factor=1, width=width, height=height, **schedule, **shared,
+        reference_downscale_factor=1, width=width, height=height, **stage_1, **shared,
     )
 
-    # Stage 2: keep the original outside the mask, upscale 2x in pixels, then a short refine.
-    stage_1 = np.where(gen_masks[..., None], _decode(pipe, video_latent), frames)
-    upscaled = [cv2.resize(f, (width * 2, height * 2), interpolation=cv2.INTER_LANCZOS4) for f in stage_1]
-    pipe.disable_lora()
+    # Stage 2: keep the original outside the mask, upsample 2x in latent space, then refine.
+    composited = np.where(gen_masks[..., None], _decode(pipe, video_latent), frames)
+    upsampler = model["upsampler"].to("cuda")
     try:
-        refined, _ = pipe(
-            latents=_encode(pipe, upscaled), audio_latents=audio_latent, width=width * 2, height=height * 2,
-            sigmas=STAGE_2_SIGMAS, num_inference_steps=len(STAGE_2_SIGMAS), **shared,
-        )
+        upsampled = upsampler(_encode(pipe, composited).to(DTYPE))
     finally:
-        pipe.enable_lora()
+        upsampler.to("cpu")
+    with _refining(model):
+        refined, _ = pipe(
+            latents=upsampled, audio_latents=audio_latent, width=width * 2, height=height * 2,
+            sigmas=STAGE_2_DISTILLED_SIGMA_VALUES, num_inference_steps=len(STAGE_2_DISTILLED_SIGMA_VALUES),
+            noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0], **NO_GUIDANCE, **shared,
+        )
     return np.ascontiguousarray(_decode(pipe, refined)[..., ::-1])
+
+
+@contextlib.contextmanager
+def _refining(model):
+    """Stage 2 setup: the unshifted scheduler, and the IC-LoRA swapped for the distilled LoRA (none on distilled)."""
+    pipe, distilled = model["pipe"], model["distilled"]
+    scheduler = pipe.scheduler
+    try:
+        pipe.scheduler = model["refine_scheduler"]
+        if distilled:
+            pipe.disable_lora()
+        else:
+            pipe.set_adapters(["distilled"], [1.0])
+        yield
+    finally:
+        pipe.scheduler = scheduler
+        if distilled:
+            pipe.enable_lora()
+        else:
+            pipe.set_adapters(["inpaint"], [1.0])
 
 
 def _decode(pipe, latents):

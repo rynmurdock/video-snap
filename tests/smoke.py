@@ -63,7 +63,7 @@ def test_full_masklets():
 
 def test_full_model():
     video, masks = synthetic_clip()
-    out = inpaint_video(video, masks, get_video_model(), long_side=256)
+    out = inpaint_video(video, masks, get_video_model(distilled=True), long_side=256)
     assert out.shape == video.shape and out.dtype == np.uint8
     assert (out[:, :10] == video[:, :10]).all(), "pixels far from the mask must be untouched"
     assert (out[masks > 0] != video[masks > 0]).any(), "masked pixels must be regenerated"
