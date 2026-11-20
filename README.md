@@ -1,12 +1,12 @@
 
 # Setup
-
+```
 uv venv
 source ./.venv/bin/activate
 uv pip install -r requirements.txt
 uv pip install -e .
 hf auth login   # after accepting the IC-LoRA & SAM3 licenses linked below
-
+```
 # Inpaint a video
 
 python -m run.process_one_video --video in.mp4 --masks masks.mp4 --out out.mp4
