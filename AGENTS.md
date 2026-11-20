@@ -15,4 +15,8 @@ Functions within this codebase take in & return video & images as cv2 numpy arra
 
 Our models are setup to run on an rtx 4090; this is subject to change but is the modus operandi for now.
 
+After you've made a significant change (new feature, fix, etc. but *not* some e.g. three-line change or edit to docs/comments), add it to your worktree, push the changes, then run tests & start a backgrounded subagent audit. Whenever you push, give me the branchname so I can diff it on my side.
 
+Try to keep your responses brief & to-the-point.
+
+When you provide info like branch names, bold them. 

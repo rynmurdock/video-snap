@@ -74,7 +74,7 @@ def _load_transformer(transformer_file, base_repo):
     )
 
 
-def inpaint_video(video, masks, model, prompt=None, seed=0, long_side=768, fps=24, dilate_px=15, feather_px=6):
+def inpaint_video(video, masks, model, prompt=None, seed=0, long_side=512, fps=24, dilate_px=15, feather_px=6):
     """Regenerate the masked region; returns a video shaped like the input.
 
     `prompt` should describe only the masked region (None works for removal).
