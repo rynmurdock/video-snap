@@ -1,5 +1,5 @@
 Todo:
-- undistilled version, incl. cfg
+- undistilled version, incl. cfg (now `--dev`; IC-LoRA is only supported on distilled)
 - cfg tricks
 - video exemplar conditioning
 
