@@ -169,9 +169,10 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
     # Stage 2: keep the original outside the mask, upscale 2x in pixels, then a short refine.
     stage_1 = np.where(gen_masks[..., None], _decode(pipe, video_latent), frames)
     upscaled = [cv2.resize(f, (width * 2, height * 2), interpolation=cv2.INTER_LANCZOS4) for f in stage_1]
-    stage_1_scheduler, pipe.scheduler = pipe.scheduler, model["refine_scheduler"]
-    pipe.disable_lora()
+    stage_1_scheduler = pipe.scheduler
     try:
+        pipe.scheduler = model["refine_scheduler"]
+        pipe.disable_lora()
         refined, _ = pipe(
             latents=_encode(pipe, upscaled), audio_latents=audio_latent, width=width * 2, height=height * 2,
             sigmas=STAGE_2_SIGMAS, num_inference_steps=len(STAGE_2_SIGMAS), **shared,
