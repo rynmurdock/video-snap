@@ -11,5 +11,6 @@ gguf
 opencv-python
 numpy
 pillow
+tqdm
 huggingface_hub
 kernels
