@@ -2,6 +2,7 @@
 
 Videos are cv2 arrays: (T, H, W, 3) uint8 BGR. Masks are (T, H, W), nonzero = inpaint.
 Follows Lightricks' official two-stage inpaint workflow (green-keyed reference, pixel 2x refine).
+Runs the full (undistilled) LTX-2.3 by default; `get_video_model(distilled=True)` swaps in the fast distilled one.
 """
 import cv2
 import numpy as np
@@ -18,9 +19,11 @@ from transformers import Gemma3ForConditionalGeneration
 from lib.video_io import check_video
 
 # Quantized weights: the full-precision model (95 GB, 38 GB transformer) does not fit a 4090.
-BASE_REPO = "diffusers/LTX-2.3-Distilled-Diffusers"
+BASE_REPO = "diffusers/LTX-2.3-Diffusers"
+DISTILLED_BASE_REPO = "diffusers/LTX-2.3-Distilled-Diffusers"
 TRANSFORMER_REPO = "QuantStack/LTX-2.3-GGUF"
-TRANSFORMER_FILE = "LTX-2.3-distilled-1.1/LTX-2.3-22B-distilled-1.1-Q4_K_M.gguf"
+TRANSFORMER_FILE = "LTX-2.3-1.1/LTX-2.3-22B-1.1-Q4_K_M.gguf"
+DISTILLED_TRANSFORMER_FILE = "LTX-2.3-distilled-1.1/LTX-2.3-22B-distilled-1.1-Q4_K_M.gguf"
 TEXT_ENCODER_REPO = "unsloth/gemma-3-12b-it-qat-bnb-4bit"
 LORA_FILE = "ltx-2.3-22b-ic-lora-in-outpainting-0.9.safetensors"
 
@@ -30,23 +33,26 @@ SIZE_STEP = 32
 MIN_STAGE_1_LONG_SIDE = 256  # below this LTX output degrades; tiny clips render above source size
 GREEN_RGB = (102, 255, 0)  # the IC-LoRA was trained with masked pixels painted this key colour
 STAGE_2_SIGMAS = [0.725, 0.421875]  # the official workflow's refine schedule
+GUIDANCE_SCALE = 1.4  # light CFG for the undistilled model
+DISTILLED_GUIDANCE_SCALE = 1.0  # the distilled model is meant to run unguided
 
 
-def get_video_model(model_path="Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting"):
-    """Load the inpainting pipeline; `model_path` is the IC-LoRA repo."""
-    transformer = _load_transformer()
+def get_video_model(model_path="Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", distilled=False):
+    """Load the inpainting pipeline; `model_path` is the IC-LoRA repo, `distilled` picks the fast base model."""
+    base_repo = DISTILLED_BASE_REPO if distilled else BASE_REPO
+    transformer = _load_transformer(DISTILLED_TRANSFORMER_FILE if distilled else TRANSFORMER_FILE, base_repo)
     text_encoder = Gemma3ForConditionalGeneration.from_pretrained(TEXT_ENCODER_REPO, dtype=DTYPE)
     pipe = LTX2InContextPipeline.from_pretrained(
-        BASE_REPO, transformer=transformer, text_encoder=text_encoder, dtype=DTYPE
+        base_repo, transformer=transformer, text_encoder=text_encoder, dtype=DTYPE
     )
-    # Kept as a togglable adapter (not fused): stage 2 runs on the bare distilled model.
+    # Kept as a togglable adapter (not fused): stage 2 runs on the bare base model.
     pipe.load_lora_weights(model_path, weight_name=LORA_FILE, adapter_name="inpaint")
     # A LoRA whose keys match nothing only logs a warning, so check that it attached.
     if "inpaint" not in pipe.get_list_adapters().get("transformer", []):
         raise RuntimeError(f"IC-LoRA from {model_path} did not attach to the transformer")
     pipe.vae.enable_tiling()
     pipe.enable_model_cpu_offload()
-    return {"pipe": pipe}
+    return {"pipe": pipe, "distilled": distilled}
 
 
 def _convert_ltx23_transformer(checkpoint, **kwargs):
@@ -55,14 +61,14 @@ def _convert_ltx23_transformer(checkpoint, **kwargs):
     return {key.replace("prompt_adaln_single", "prompt_adaln"): value for key, value in converted.items()}
 
 
-def _load_transformer():
+def _load_transformer(transformer_file, base_repo):
     # Patches diffusers' global converter entry; the rename is a no-op for older LTX-2 checkpoints.
     loadable = SINGLE_FILE_LOADABLE_CLASSES["LTX2VideoTransformer3DModel"]
     loadable["checkpoint_mapping_fn"] = _convert_ltx23_transformer
     return LTX2VideoTransformer3DModel.from_single_file(
-        hf_hub_download(TRANSFORMER_REPO, TRANSFORMER_FILE),
+        hf_hub_download(TRANSFORMER_REPO, transformer_file),
         quantization_config=GGUFQuantizationConfig(compute_dtype=DTYPE),
-        config=BASE_REPO,
+        config=base_repo,
         subfolder="transformer",
         dtype=DTYPE,
     )
@@ -80,7 +86,7 @@ def inpaint_video(video, masks, model, prompt=None, seed=0, long_side=768, fps=2
         raise ValueError(f"masks must be (T, H, W) = {video.shape[:3]}, got {masks.shape}")
     long_side = _stage_1_long_side(video.shape[1:3], long_side)
     frames, gen_masks = _prepare(video, masks, long_side, dilate_px)
-    generated = _generate(frames, gen_masks, model, prompt or "", seed, fps)
+    generated = _generate(frames, gen_masks, model, prompt or "The scene", seed, fps)
     return _composite(video, _resize_masks(gen_masks[: len(video)], video.shape[1:3]), generated, feather_px)
 
 
@@ -131,14 +137,14 @@ def _resize_masks(masks, size):
 @torch.inference_mode()
 def _generate(frames, gen_masks, model, prompt, seed, fps):
     """Two-stage LTX inpaint; returns (T, 2H, 2W, 3) uint8 BGR at twice the generation size."""
-    pipe = model["pipe"]
+    pipe, distilled = model["pipe"], model["distilled"]
     num_frames, height, width = gen_masks.shape
     generator = torch.Generator("cuda").manual_seed(seed)
     prompt_embeds, prompt_mask, _, _ = pipe.encode_prompt(prompt, do_classifier_free_guidance=False, device="cuda")
-    # Every guidance knob off: the distilled model is meant to run unguided.
+    # Only plain CFG is used (none for distilled); STG, modality and rescale guidance stay off.
     shared = dict(
         prompt_embeds=prompt_embeds, prompt_attention_mask=prompt_mask, num_frames=num_frames, frame_rate=fps,
-        guidance_scale=1.0, stg_scale=0.0, modality_scale=1.0, guidance_rescale=0.0,
+        guidance_scale=DISTILLED_GUIDANCE_SCALE if distilled else GUIDANCE_SCALE, stg_scale=0.0, modality_scale=1.0, guidance_rescale=0.0,
         audio_guidance_scale=1.0, audio_stg_scale=0.0, audio_modality_scale=1.0, audio_guidance_rescale=0.0,
         generator=generator, output_type="latent", return_dict=False,
     )
@@ -146,11 +152,12 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
     # Stage 1: the reference shows the scene with the region to fill painted green.
     reference = frames.copy()
     reference[gen_masks] = GREEN_RGB
+    # Distilled runs its fixed few-step schedule; undistilled uses the pipeline's default steps.
+    schedule = dict(sigmas=DISTILLED_SIGMA_VALUES, num_inference_steps=len(DISTILLED_SIGMA_VALUES)) if distilled else {}
     pipe.enable_lora()
     video_latent, audio_latent = pipe(
         reference_conditions=[LTX2ReferenceCondition(frames=[Image.fromarray(f) for f in reference])],
-        reference_downscale_factor=1, width=width, height=height,
-        sigmas=DISTILLED_SIGMA_VALUES, num_inference_steps=len(DISTILLED_SIGMA_VALUES), **shared,
+        reference_downscale_factor=1, width=width, height=height, **schedule, **shared,
     )
 
     # Stage 2: keep the original outside the mask, upscale 2x in pixels, then a short refine.
