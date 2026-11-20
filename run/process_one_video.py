@@ -20,7 +20,7 @@ def parse_args():
     parser.add_argument("--prompt", default=None, help="describe only the masked region")
     parser.add_argument("--long-side", type=int, default=512, help="cap on stage-1 size; stage 2 renders at 2x")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--distilled", action="store_true", help="run stage 1 on the fast distilled LTX instead of the full dev model")
+    parser.add_argument("--distilled", action="store_true", help="use the fast distilled LTX instead of dev + distilled-LoRA refine")
     args = parser.parse_args()
     check_masklet_args(parser, args, outputs=[args.out, *([args.save_masks] if args.save_masks else [])])
     return args
