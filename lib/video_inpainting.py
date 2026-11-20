@@ -7,7 +7,9 @@ Runs the full (undistilled) LTX-2.3 by default; `get_video_model(distilled=True)
 import cv2
 import numpy as np
 import torch
-from diffusers import GGUFQuantizationConfig, LTX2InContextPipeline, LTX2VideoTransformer3DModel
+from diffusers import (
+    FlowMatchEulerDiscreteScheduler, GGUFQuantizationConfig, LTX2InContextPipeline, LTX2VideoTransformer3DModel
+)
 from diffusers.loaders.single_file_model import SINGLE_FILE_LOADABLE_CLASSES
 from diffusers.loaders.single_file_utils import convert_ltx2_transformer_to_diffusers
 from diffusers.pipelines.ltx2.pipeline_ltx2_ic_lora import LTX2ReferenceCondition, retrieve_latents
@@ -52,7 +54,11 @@ def get_video_model(model_path="Lightricks/LTX-2.3-22b-IC-LoRA-In-Outpainting", 
         raise RuntimeError(f"IC-LoRA from {model_path} did not attach to the transformer")
     pipe.vae.enable_tiling()
     pipe.enable_model_cpu_offload()
-    return {"pipe": pipe, "distilled": distilled}
+    # The dev scheduler time-shifts custom sigmas; stage 2 needs STAGE_2_SIGMAS used as given.
+    refine_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+        pipe.scheduler.config, use_dynamic_shifting=False, shift_terminal=None
+    )
+    return {"pipe": pipe, "distilled": distilled, "refine_scheduler": refine_scheduler}
 
 
 def _convert_ltx23_transformer(checkpoint, **kwargs):
@@ -163,6 +169,7 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
     # Stage 2: keep the original outside the mask, upscale 2x in pixels, then a short refine.
     stage_1 = np.where(gen_masks[..., None], _decode(pipe, video_latent), frames)
     upscaled = [cv2.resize(f, (width * 2, height * 2), interpolation=cv2.INTER_LANCZOS4) for f in stage_1]
+    stage_1_scheduler, pipe.scheduler = pipe.scheduler, model["refine_scheduler"]
     pipe.disable_lora()
     try:
         refined, _ = pipe(
@@ -170,6 +177,7 @@ def _generate(frames, gen_masks, model, prompt, seed, fps):
             sigmas=STAGE_2_SIGMAS, num_inference_steps=len(STAGE_2_SIGMAS), **shared,
         )
     finally:
+        pipe.scheduler = stage_1_scheduler
         pipe.enable_lora()
     return np.ascontiguousarray(_decode(pipe, refined)[..., ::-1])
 
