@@ -25,6 +25,8 @@ def parse_args():
     parser.add_argument("--distilled", action="store_true", help="use the fast distilled LTX instead of dev + distilled-LoRA refine")
     parser.add_argument("--first-window", action="store_true", help="render only the first window (a short preview)")
     args = parser.parse_args()
+    if args.dilate_px < 0:
+        parser.error("--dilate-px must be >= 0")
     check_masklet_args(parser, args, outputs=[args.out, *([args.save_masks] if args.save_masks else [])])
     return args
 

@@ -108,7 +108,6 @@ def inpaint_video(
     check_video(video)
     if masks.shape != video.shape[:3]:
         raise ValueError(f"masks must be (T, H, W) = {video.shape[:3]}, got {masks.shape}")
-    masks = dilate_masks(masks, dilate_px)
     long_side = _stage_1_long_side(video.shape[1:3], long_side)
     window = window or _window_frames(*_generation_size(*video.shape[1:3], long_side), overlap)
     spans = _windows(len(video), window, overlap)
@@ -118,7 +117,7 @@ def inpaint_video(
     out = np.empty_like(video[:spans[-1][1]])
     context = None
     for i, (start, stop) in enumerate(tqdm(spans, desc="windows", unit="window")):
-        frames, gen_masks = _prepare(video[start:stop], masks[start:stop], long_side)
+        frames, gen_masks = _prepare(video[start:stop], dilate_masks(masks[start:stop], dilate_px), long_side)
         stage_1, stage_2 = _generate(frames, gen_masks, model, encoded_prompt, seed + i, fps, context)
         real = stop - start  # drop the 8k + 1 padding frames
         stage_1, stage_2 = stage_1[:real], stage_2[:real]
