@@ -41,7 +41,7 @@ GREEN_RGB = (102, 255, 0)  # the IC-LoRA was trained with masked pixels painted 
 DEV_STEPS = 30
 # diffusers' recommended LTX-2.3 guidance for the dev model (the pipeline's own defaults).
 DEV_GUIDANCE = dict(
-    guidance_scale=3.0, stg_scale=1.0, modality_scale=3.0, guidance_rescale=0.7, spatio_temporal_guidance_blocks=[28],
+    guidance_scale=5.0, stg_scale=1.0, modality_scale=3.0, guidance_rescale=0.7, spatio_temporal_guidance_blocks=[28],
     audio_guidance_scale=7.0, audio_stg_scale=1.0, audio_modality_scale=3.0, audio_guidance_rescale=0.7,
 )
 # Distilled weights run unguided; every audio knob too, since audio CFG > 1 alone switches CFG on.
